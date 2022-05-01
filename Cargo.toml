@@ -1,0 +1,20 @@
+[package]
+name = "kuiper"
+version = "0.1.0"
+description = "SOCKS5 PROXY server in Rust"
+edition = "2021"
+license = "MIT"
+authors = ["Yuanyeex <yuanyeex@gmail.com>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "3.1.14", features = ["derive"] }
+csv = "1.1.6"
+log = "0.4.16"
+pretty_env_logger = "0.4.0"
+serde = "1.0.137"
+serde_derive = "1.0.137"
+snafu = "0.7.0"
+thiserror = "1.0.31"
+tokio = { version = "1.18.0", features = ["full"] }
