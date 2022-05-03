@@ -174,7 +174,9 @@ impl KuiperProxy {
             tokio::spawn(async move {
                 let mut client = SockClient::new(stream, users, auth_methods, timeout);
                 match client.init().await {
-                    Ok(_) => {},
+                    Ok(_) => {
+                        trace!("Client init ok.. ");
+                    },
                     Err(error) => {
                         error!("Error! {:?}, client {:?}", error, client_addr);
                         if let Err(e) = SocksReply::new(error.into()).send(&mut client.stream).await
@@ -246,7 +248,6 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
         debug!("New Connection");
         let mut header = [0u8; 2];
         // read a byte from the stream and determin the version being requested;
-        self.stream.read_exact(&mut header).await?;
         self.stream.read_exact(&mut header).await?;
 
         self.socks_version = header[0];
@@ -392,14 +393,17 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     }
 
     async fn get_available_methods(&mut self) -> io::Result<Vec<u8>> {
+        trace!("n auth method: {}", self.auth_nmethods);
         let mut methods = Vec::with_capacity(self.auth_nmethods as usize);
         for _ in 0..self.auth_nmethods {
-            let mut method = [0u8, 1];
+            let mut method = [0u8; 1];
             self.stream.read_exact(&mut method).await?;
+            trace!("check auth type {}, against {:?}", &method[0], self.auth_methods.clone());
             if self.auth_methods.contains(&method[0]) {
                 methods.append(&mut method.to_vec());
             }
         }
+        trace!("checked methods: {:?}", &methods);
         Ok(methods)
     }
 }

@@ -8,15 +8,15 @@ use log::{info, trace};
 
 const LOGO: &str = r"
 
- _   __      _       _            
- | | / /     (_)     | |           
- | |/ / _   _ _ _ __ | |_ ___ _ __ 
+ _   __      _       _
+ | | / /     (_)     | |
+ | |/ / _   _ _ _ __ | |_ ___ _ __
  |    \| | | | | '_ \| __/ _ | '__|
- | |\  | |_| | | |_) | ||  __| |   
- \_| \_/\__,_|_| .__/ \__\___|_|   
-               | |                 
-               |_|               
- A SOCKS5 Proxy server powered by Rust              
+ | |\  | |_| | | |_) | ||  __| |
+ \_| \_/\__,_|_| .__/ \__\___|_|
+               | |
+               |_|
+ A SOCKS5 Proxy server powered by Rust
 ";
 
 #[derive(Parser, Debug)]
@@ -38,6 +38,7 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+
     println!("{}", LOGO);
     // parse input configs
     let config = Config::parse();
@@ -49,15 +50,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     pretty_env_logger::init_timed();
 
-    // Initrialize proxy configs
-
+    // Init proxy configs
     let mut auth_methods: Vec<u8> = Vec::new();
 
-
+    trace!("init config, no_auth {:?}, credential {:?}, listen at: {:?}:{:?}", config.no_auth, config.credentials,
+    config.ip, config.port);
 
     // Accept connections without auth
     if config.no_auth {
-        auth_methods.push(kuiper::AuthTypes::NoAuth as u8);
+        auth_methods.push(AuthTypes::NoAuth as u8);
     }
 
     // Enable username/password authentication
