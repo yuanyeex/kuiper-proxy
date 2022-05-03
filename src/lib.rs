@@ -289,7 +289,8 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
                 let time_out = if let Some(time_out) = self.timeout {
                     time_out
                 } else {
-                    Duration::from_millis(50)
+                    // default timeout 1 seconds
+                    Duration::from_millis(1_000)
                 };
 
                 let mut target =
@@ -298,8 +299,14 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
                     async move {TcpStream::connect(&sock_addr[..]).await },
                     )
                     .await
-                        .map_err(|_| KuiperError::Socks(ResponseCode::AddrTypeNotSupported))
-                        .map_err(|_| KuiperError::Socks(ResponseCode::AddrTypeNotSupported))??;
+                        .map_err(|e| {
+                            trace!("elapsed exception: {:?}", e);
+                            KuiperError::Socks(ResponseCode::AddrTypeNotSupported)
+                        })
+                        .map_err(|e| {
+                            trace!("kuiper error {:?}", e);
+                            KuiperError::Socks(ResponseCode::AddrTypeNotSupported)
+                        })??;
 
                 trace!("Connected!");
                 SocksReply::new(ResponseCode::Success)
