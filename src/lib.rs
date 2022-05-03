@@ -1,10 +1,13 @@
 use std::{time::Duration, sync::Arc, vec};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-use log::{info, debug, warn, trace};
+use log::{info, debug, warn, trace, error};
 use serde_derive::Deserialize;
 use snafu::Snafu;
 use thiserror::Error;
-use tokio::{net::TcpListener, io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, AsyncReadExt}, sync::watch::error, time::Timeout};
+use tokio::{net::TcpListener, io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, AsyncReadExt}};
+use tokio::net::{lookup_host, TcpStream};
+use tokio::time::timeout;
 
 /// Version of socks
 const SOCKS_VERSION: u8 = 0x05;
@@ -16,7 +19,7 @@ pub struct User {
     password: String
 }
 
-pub struct SocksProtocol {
+pub struct SocksReply {
     // As rfc 1928 (S6)
     // the server evaluates the request, and returns a reply formed as follows:
     //
@@ -29,26 +32,26 @@ pub struct SocksProtocol {
     buf: [u8; 10],
 }
 
-impl SocksProtocol {
+impl SocksReply {
     pub fn new(status: ResponseCode) -> Self {
         let buf = [
             // VER
-            SOCKS_VERSION, 
+            SOCKS_VERSION,
             // REP
-            status as u8, 
+            status as u8,
             // RSV
-            RESERVED, 
+            RESERVED,
             // ATYPS
-            1, 
+            1,
             // BND.ADDR
             0, 0, 0, 0,
-            // BND.PORT 
+            // BND.PORT
             0, 0
         ];
         Self{ buf }
     }
 
-    pub async fn send<T>(&self, stream: &mut T) -> io::Result<()> 
+    pub async fn send<T>(&self, stream: &mut T) -> io::Result<()>
     where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         stream.write_all(&self.buf[..]).await?;
@@ -87,9 +90,20 @@ impl From<KuiperError> for ResponseCode{
 }
 
 enum AddrType {
-    v4 = 0x01,
+    V4 = 0x01,
     Domain = 0x03,
-    v6 = 0x04
+    V6 = 0x04,
+}
+
+impl AddrType {
+    fn from(n: usize) -> Option<AddrType> {
+        match n {
+            1 => Some(AddrType::V4),
+            3 => Some(AddrType::Domain),
+            4 => Some(AddrType::V6),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug)]
 enum SockCommand {
@@ -128,6 +142,7 @@ pub enum AuthTypes {
 
 pub struct KuiperProxy {
     listener: TcpListener,
+    users: Arc<Vec<User>>,
     auth_methods: Arc<Vec<u8>>,
     timeout: Option<Duration>,
 }
@@ -137,12 +152,14 @@ impl KuiperProxy {
         port: u16,
         ip: &str,
         auth_methods: Vec<u8>,
+        users: Vec<User>,
         timeout: Option<Duration>,
     ) -> io::Result<Self> {
         info!("Listening on {}:{}", ip, port);
         Ok(KuiperProxy {
             listener: TcpListener::bind((ip, port)).await?,
             auth_methods: Arc::new(auth_methods),
+            users: Arc::new(users),
             timeout,
         })
     }
@@ -150,13 +167,27 @@ impl KuiperProxy {
     pub async fn serve(&mut self) {
         info!("Serving connections");
         while let Ok((stream, client_addr)) = self.listener.accept().await {
-            // currently all 
+            // currently all
             let auth_methods = self.auth_methods.clone();
             let timeout = self.timeout.clone();
-
+            let users = self.users.clone();
             tokio::spawn(async move {
-                let mut client = SOCKClient::new
-            })
+                let mut client = SockClient::new(stream, users, auth_methods, timeout);
+                match client.init().await {
+                    Ok(_) => {},
+                    Err(error) => {
+                        error!("Error! {:?}, client {:?}", error, client_addr);
+                        if let Err(e) = SocksReply::new(error.into()).send(&mut client.stream).await
+                        {
+                            warn!("Failed to send error code: {:?}", e);
+                        }
+
+                        if let Err(e) = client.shutdown().await {
+                            warn!("Failed to shutdown TcpStream: {:?}", e);
+                        }
+                    }
+                }
+            });
         }
     }
 }
@@ -177,13 +208,13 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
         auth_methods: Arc<Vec<u8>>,
         timeout: Option<Duration>,
     ) -> Self {
-        SockClient { 
-            stream, 
-            auth_nmethods: 0, 
-            socks_version: 0, 
+        SockClient {
+            stream,
+            auth_nmethods: 0,
+            socks_version: 0,
             authed_users,
             auth_methods,
-            timeout, 
+            timeout,
         }
     }
 
@@ -197,7 +228,8 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
         SockClient { stream, auth_nmethods: 0, authed_users, auth_methods, socks_version: 0, timeout, }
     }
 
-    pub fn stream_mut(&mut self, user: &User) -> &mut T {
+
+    pub fn stream_mut(&mut self) -> &mut T {
         &mut self.stream
     }
 
@@ -225,12 +257,12 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
         match self.socks_version {
             SOCKS_VERSION => {
                 self.auth().await?;
-                self.handle_client().await?
-            }
+                self.handle_client().await?;
+            },
             _ => {
                 warn!("Init: unsupported version: SOCKS{}" , &self.socks_version);
                 self.shutdown().await?;
-            }
+            },
         }
 
         Ok(())
@@ -239,7 +271,54 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     pub async fn handle_client(&mut self) -> Result<usize, KuiperError> {
         debug!("Starting to read data");
 
-        let req = SockReque
+        let req = SocksRequest::from_stream(&mut self.stream).await?;
+
+        let displayed_addr = pretty_print_addr(&req.addr_type, &req.addr);
+
+        info!("New Request: Command: {:?} addr: {} port {}", req.command, displayed_addr, req.port);
+
+        // Response
+        match req.command {
+            // Use the Proxy to connect to the specified addr/port
+            SockCommand::Connect => {
+                debug!("Handling Connect Command");
+                let sock_addr = addr_to_socket(&req.addr_type, &req.addr, req.port).await?;
+                trace!("Connecting to {:?}", sock_addr);
+
+                let time_out = if let Some(time_out) = self.timeout {
+                    time_out
+                } else {
+                    Duration::from_millis(50)
+                };
+
+                let mut target =
+                    timeout(
+                        time_out,
+                    async move {TcpStream::connect(&sock_addr[..]).await },
+                    )
+                    .await
+                        .map_err(|_| KuiperError::Socks(ResponseCode::AddrTypeNotSupported))
+                        .map_err(|_| KuiperError::Socks(ResponseCode::AddrTypeNotSupported))??;
+
+                trace!("Connected!");
+                SocksReply::new(ResponseCode::Success)
+                    .send(&mut self.stream)
+                    .await?;
+
+                trace!("copy bidirectional");
+                match io::copy_bidirectional(&mut self.stream, &mut target).await {
+                    // ignore not connected for shutdown error
+                    Err(e) if e.kind() == io::ErrorKind::NotConnected => {
+                        trace!("already closed");
+                        Ok(0)
+                    },
+                    Err(e) => Err(KuiperError::Io(e)),
+                    Ok((_s_to_t, t_to_s)) => Ok(t_to_s as usize),
+                }
+            },
+            SockCommand::Bind => Err(KuiperError::Io(io::Error::new(io::ErrorKind::Unsupported, "Bind not supported"))),
+            SockCommand::UdpAssosiate => Err(KuiperError::Io(io::Error::new(io::ErrorKind::Unsupported, "UdpAssosiate not supported"))),
+        }
     }
 
     async fn auth(&mut self) -> Result<(), KuiperError> {
@@ -266,6 +345,7 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
             debug!("Auth header: [{}, {}]", header[0], header[1]);
 
             // user name parsing
+            let ulen = header[1] as usize;
             let mut username = vec![0; ulen];
             self.stream.read_exact(&mut username).await?;
 
@@ -273,10 +353,13 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
             let mut plen = [0u8, 1];
             self.stream.read_exact(&mut plen).await?;
 
-            let mut password = vec![0,; plen[0] as usize];
+            let mut password = vec![0; plen[0] as usize];
             self.stream.read_exact(&mut password).await?;
 
-            let user = User {username, password}; 
+            let username = String::from_utf8_lossy(&username).to_string();
+            let password = String::from_utf8_lossy(&password).to_string();
+
+            let user = User {username, password};
 
             if self.authed(&user) {
                 debug!("Access Granted. User: {}", user.username);
@@ -292,7 +375,7 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 
             Ok(())
         } else if methods.contains(&(AuthTypes::NoAuth as u8)) {
-            // set the auth method to no auth 
+            // set the auth method to no auth
             response[1] = AuthTypes::NoAuth as u8;
             debug!("Sending NOAUTH packet");
             self.stream.write_all(&response).await?;
@@ -306,8 +389,6 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 
             Err(KuiperError::Socks(ResponseCode::Failure))
         }
-
-    
     }
 
     async fn get_available_methods(&mut self) -> io::Result<Vec<u8>> {
@@ -323,7 +404,69 @@ impl <T> SockClient<T> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     }
 }
 
+async fn addr_to_socket(addr_type: &AddrType, addr: &[u8], port: u16) -> io::Result<Vec<SocketAddr>> {
+    match addr_type {
+        AddrType::V6 => {
+            let new_addr = (0..8)
+                .map(|x| {
+                    trace!("{} and {}", x*2, x*2 - 1);
+                    u16::from(addr[(x * 2)]) << 8 | u16::from(addr[(x*2) + 1])
+                })
+                .collect::<Vec<u16>>();
 
+            Ok(vec![SocketAddr::from(SocketAddrV6::new(
+                Ipv6Addr::new(
+                    new_addr[0],
+                    new_addr[1],
+                    new_addr[2],
+                    new_addr[3],
+                    new_addr[4],
+                    new_addr[5],
+                    new_addr[6],
+                    new_addr[7],
+                ),
+                port,
+                0,
+                0
+            ))])
+        },
+        AddrType::V4 => Ok(vec![SocketAddr::from(SocketAddrV4::new(
+            Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]),
+            port,
+        ))]),
+        AddrType::Domain => {
+            let mut domain = String::from_utf8_lossy(addr).to_string();
+            domain.push(':');
+            domain.push_str(&port.to_string());
+
+            Ok(lookup_host(domain).await?.collect())
+        }
+    }
+}
+
+// convert and addr type and address to string
+fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
+    match addr_type {
+        AddrType::Domain => String::from_utf8_lossy(addr).to_string(),
+        AddrType::V4 => addr.iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<String>>()
+            .join("."),
+        AddrType::V6 => {
+            let addr_16 = (0..8)
+                .map(|x|(u16::from(addr[x * 2]) << 8 | u16::from(addr[(x * 2) + 1])))
+                .collect::<Vec<u16>>();
+
+            addr_16
+                .iter()
+                .map(|x| format!("{:x}", x))
+                .collect::<Vec<String>>()
+                .join(":")
+        }
+    }
+}
+
+#[allow(dead_code)]
 struct SocksRequest {
     pub version: u8,
     pub command: SockCommand,
@@ -332,17 +475,85 @@ struct SocksRequest {
     pub port: u16,
 }
 
-// impl SocksRequest {
-//     async fn from_stream<T>(stream: &mut T) -> Result<Self, KuiperError> where T: AsyncRead + AsyncWrite + Send + Unpin + 'static, {
-//         // from rfc 1928 (S4), the socks request is formed as follow:
-//         // 
-//         //    +----+-----+-------+------+----------+----------+
-//         //    |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-//         //    +----+-----+-------+------+----------+----------+
-//         //    | 1  |  1  | X'00' |  1   | Variable |    2     |
-//         //    +----+-----+-------+------+----------+----------+
+impl SocksRequest {
+    // Parse a SOCKS request from a TcpStream
+    async fn from_stream<T>(stream: &mut T) -> Result<Self, KuiperError>
+        where
+            T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        // From rfc 1928 (S4), the socks request is formed as:
+        //
+        //    +----+-----+-------+------+----------+----------+
+        //    |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+        //    +----+-----+-------+------+----------+----------+
+        //    | 1  |  1  | X'00' |  1   | Variable |    2     |
+        //    +----+-----+-------+------+----------+----------+
+        trace!("Server waiting for connect");
+        let mut packet = [0u8; 4];
+        // Read a byte from the stream and determine the version being requested
+        stream.read_exact(&mut packet).await?;
+        trace!("Server received: {:?}", packet);
+        if packet[0] != SOCKS_VERSION {
+            warn!("from_stream Unsupported version: SOCKS{}", packet[0]);
+            stream.shutdown().await?;
+        }
 
+        // get command
+        let command = match SockCommand::from(packet[1] as usize) {
+            Some(cmd) => Ok(cmd),
+            None => {
+                warn!("Invalid Command");
+                stream.shutdown().await?;
+                Err(KuiperError::Socks(ResponseCode::CommandNotSupported))
+            }
+        }?;
 
-//     }
+        // get addr
+        trace!("Get addr type!");
+        let addr_type = match AddrType::from(packet[3] as usize) {
+            Some(addr) => Ok(addr),
+            None => {
+                error!("No addr type");
+                stream.shutdown().await?;
+                Err(KuiperError::Socks(ResponseCode::AddrTypeNotSupported))
+            }
+        }?;
 
+        trace!("Get Addr!");
+        // Get adddr from addr_type and stream
+        let addr: Vec<u8> = match addr_type {
+            AddrType::Domain => {
+                let mut dlen = [0u8; 1];
+                stream.read_exact(&mut dlen).await?;
+                let mut domain = vec![0u8; dlen[0] as usize];
+                stream.read_exact(&mut domain).await?;
+                domain
+            },
+            AddrType::V4 => {
+                let mut addr = vec![0u8; 4];
+                stream.read_exact(&mut addr).await?;
+                addr
+            },
+            AddrType::V6 => {
+                let mut addr = vec![0u8; 16];
+                stream.read_exact(&mut addr).await?;
+                addr
+            }
+        };
+        // Read DST.port
+        let mut port = [0u8, 2];
+        stream.read_exact(&mut port).await?;
+
+        let port = u16::from(port[0]) << 8 | u16::from(port[1]);
+
+        // Return parsed requet
+        Ok(SocksRequest{
+            version: packet[0],
+            command,
+            addr_type,
+            addr,
+            port
+        })
+    }
 }
+

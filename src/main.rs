@@ -1,9 +1,10 @@
-use std::{path::PathBuf, env, ptr::NonNull};
+use std::{path::PathBuf, env};
 
-use kuiper::KuiperProxy;
+use kuiper::{AuthTypes, KuiperProxy, User};
 use snafu::Error;
 
 use clap::{ArgGroup, Parser};
+use log::{info, trace};
 
 const LOGO: &str = r"
 
@@ -43,7 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // logging prepared
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "kuiper=INFO")
+        env::set_var("RUST_LOG", "kuiper=TRACE")
     }
 
     pretty_env_logger::init_timed();
@@ -52,15 +53,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut auth_methods: Vec<u8> = Vec::new();
 
+
+
     // Accept connections without auth
     if config.no_auth {
         auth_methods.push(kuiper::AuthTypes::NoAuth as u8);
     }
 
     // Enable username/password authentication
-    // TODO, not implemented yet
+    let authed_users: Result<Vec<User>, Box<dyn Error>> = match config.credentials {
+        Some(credential_file) => {
+            auth_methods.push(AuthTypes::UserPass as u8);
+            let mut users: Vec<User> = Vec::new();
+            let mut rdr = csv::Reader::from_path(credential_file)?;
+            for result in rdr.deserialize() {
+                let record: User = result?;
 
-    let mut kuiper = KuiperProxy::new(config.port, &config.ip, auth_methods, None).await?;
+                info!("Loaded user: {}", record.username);
+                users.push(record);
+            }
+            Ok(users)
+        },
+        _ => Ok(Vec::new()),
+    };
+
+    let authed_users = authed_users?;
+
+    let mut kuiper = KuiperProxy::new(config.port, &config.ip, auth_methods, authed_users, None).await?;
     kuiper.serve().await;
     Ok(())
 }
